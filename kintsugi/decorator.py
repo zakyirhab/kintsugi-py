@@ -4,6 +4,7 @@ Core @heal decorator and in-memory hot-swap engine for KintsugiPy.
 
 from functools import wraps
 import inspect
+import logging
 import sys
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Type, Union
@@ -12,6 +13,8 @@ from kintsugi.cache import PatchCache, compute_fingerprint
 from kintsugi.inspector import build_repair_prompt, extract_function_source
 from kintsugi.providers import LLMProvider, resolve_provider
 from kintsugi.sandbox import compile_and_extract_function, validate_contract
+
+logger = logging.getLogger("kintsugi")
 
 
 class FunctionState:
@@ -60,8 +63,10 @@ def heal(
                 state.active_func = rehydrated_fn
                 state.is_healed = True
                 state.last_patch_code = cached_patch
-            except Exception:
+                logger.info("[Kintsugi] Rehydrated '%s' from disk cache.", state.func_name)
+            except Exception as e:
                 # If cached patch is somehow invalid, fallback to original function
+                logger.warning("[Kintsugi] Failed to rehydrate '%s' from cache: %s", state.func_name, e)
                 state.active_func = func
 
         # Resolve provider on demand
@@ -84,11 +89,24 @@ def heal(
                     return validate_contract(result, schema)
                 except Exception as initial_exc:
                     # Enter healing cycle
+                    logger.warning(
+                        "[Kintsugi] Unhandled exception in '%s': %s. Initiating repair cycle...",
+                        state.func_name,
+                        initial_exc,
+                    )
                     active_provider = get_provider()
                     current_exc = initial_exc
                     fn_globals = getattr(func, "__globals__", {})
 
                     for attempt in range(1, max_retries + 1):
+                        logger.debug(
+                            "[Kintsugi] Attempt %d/%d repairing '%s' via %s (%s)",
+                            attempt,
+                            max_retries,
+                            state.func_name,
+                            active_provider.__class__.__name__,
+                            active_provider.model,
+                        )
                         tb_str = "".join(
                             traceback.format_exception(
                                 type(current_exc), current_exc, current_exc.__traceback__
@@ -140,14 +158,31 @@ def heal(
                                 },
                             )
 
+                            logger.info(
+                                "[Kintsugi] Successfully healed and hot-swapped '%s' in memory (attempt %d).",
+                                state.func_name,
+                                attempt,
+                            )
+
                             if on_heal:
                                 on_heal(state.func_name, patch_code)
 
                             return validated_result
 
                         except Exception as repair_exc:
+                            logger.warning(
+                                "[Kintsugi] Attempt %d to heal '%s' failed: %s",
+                                attempt,
+                                state.func_name,
+                                repair_exc,
+                            )
                             current_exc = repair_exc
                             if attempt == max_retries:
+                                logger.error(
+                                    "[Kintsugi] Failed to heal '%s' after %d attempts.",
+                                    state.func_name,
+                                    max_retries,
+                                )
                                 raise RuntimeError(
                                     f"Kintsugi failed to heal '{state.func_name}' after {max_retries} attempts. Last error: {str(repair_exc)}"
                                 ) from initial_exc
@@ -165,11 +200,24 @@ def heal(
                     return validate_contract(result, schema)
                 except Exception as initial_exc:
                     # Enter healing cycle
+                    logger.warning(
+                        "[Kintsugi] Unhandled exception in '%s': %s. Initiating repair cycle...",
+                        state.func_name,
+                        initial_exc,
+                    )
                     active_provider = get_provider()
                     current_exc = initial_exc
                     fn_globals = getattr(func, "__globals__", {})
 
                     for attempt in range(1, max_retries + 1):
+                        logger.debug(
+                            "[Kintsugi] Attempt %d/%d repairing '%s' via %s (%s)",
+                            attempt,
+                            max_retries,
+                            state.func_name,
+                            active_provider.__class__.__name__,
+                            active_provider.model,
+                        )
                         tb_str = "".join(
                             traceback.format_exception(
                                 type(current_exc), current_exc, current_exc.__traceback__
@@ -221,14 +269,31 @@ def heal(
                                 },
                             )
 
+                            logger.info(
+                                "[Kintsugi] Successfully healed and hot-swapped '%s' in memory (attempt %d).",
+                                state.func_name,
+                                attempt,
+                            )
+
                             if on_heal:
                                 on_heal(state.func_name, patch_code)
 
                             return validated_result
 
                         except Exception as repair_exc:
+                            logger.warning(
+                                "[Kintsugi] Attempt %d to heal '%s' failed: %s",
+                                attempt,
+                                state.func_name,
+                                repair_exc,
+                            )
                             current_exc = repair_exc
                             if attempt == max_retries:
+                                logger.error(
+                                    "[Kintsugi] Failed to heal '%s' after %d attempts.",
+                                    state.func_name,
+                                    max_retries,
+                                )
                                 raise RuntimeError(
                                     f"Kintsugi failed to heal '{state.func_name}' after {max_retries} attempts. Last error: {str(repair_exc)}"
                                 ) from initial_exc

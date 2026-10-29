@@ -2,10 +2,10 @@
 
 > **"Treat breakage and repair as part of an application's history, rather than a catastrophic failure."**
 
+[![CI](https://github.com/zakyirhab/kintsugi-py/actions/workflows/ci.yml/badge.svg)](https://github.com/zakyirhab/kintsugi-py/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/kintsugi-py.svg?color=blue)](https://pypi.org/project/kintsugi-py/)
 [![Python versions](https://img.shields.io/pypi/pyversions/kintsugi-py.svg)](https://pypi.org/project/kintsugi-py/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-23%20passed-brightgreen.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/zakyirhab/kintsugi-py/blob/main/LICENSE)
 
 **KintsugiPy** is an autonomous, self-healing runtime engine for Python functions powered by Universal LLMs. When a function encounters an unhandled exception or upstream schema drift (e.g. web scraping layout changes, third-party API mutations, malformed dirty payloads), KintsugiPy:
 
@@ -200,6 +200,16 @@ Allowing an LLM to generate code at runtime requires uncompromised security. Kin
 
 ---
 
+## 📂 Runnable Examples
+
+Explore the [`examples/`](https://github.com/zakyirhab/kintsugi-py/tree/main/examples) directory for complete executable demos:
+
+- [`01_quickstart.py`](https://github.com/zakyirhab/kintsugi-py/blob/main/examples/01_quickstart.py): Basic exception intercept & hot-swapping.
+- [`02_pydantic_contracts.py`](https://github.com/zakyirhab/kintsugi-py/blob/main/examples/02_pydantic_contracts.py): Output coercion with strict data models.
+- [`03_async_resilient_scraper.py`](https://github.com/zakyirhab/kintsugi-py/blob/main/examples/03_async_resilient_scraper.py): Asynchronous web scraping resilience.
+
+---
+
 ## 🧪 Testing
 
 The test suite covers synchronous healing, async coroutines, AST guardrails, multi-provider auto-detection, Pydantic coercion, and real-world web scraper simulation:
@@ -212,4 +222,4 @@ uv run pytest -v
 
 ## 📄 License
 
-MIT License. Designed and built with precision.
+Released under the [MIT License](LICENSE). Designed and built with precision by [Zaky Irhab](https://zakyirhab.it.com/).

@@ -45,6 +45,13 @@ dev = [
     "pytest-asyncio>=0.23.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/zakyirhab/kintsugi-py"
+Documentation = "https://github.com/zakyirhab/kintsugi-py#readme"
+Repository = "https://github.com/zakyirhab/kintsugi-py"
+Issues = "https://github.com/zakyirhab/kintsugi-py/issues"
+Changelog = "https://github.com/zakyirhab/kintsugi-py/releases"
+
 [tool.hatch.build.targets.wheel]
 packages = ["kintsugi"]
 
