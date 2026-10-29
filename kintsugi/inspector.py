@@ -1,6 +1,6 @@
 """
 Crime Scene Inspector for KintsugiPy.
-Extracts source code, traceback, and slices runtime arguments safely.
+Extracts source code, traceback, and serializes arguments with privacy redaction.
 """
 
 import inspect
@@ -8,14 +8,12 @@ import textwrap
 import traceback
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
+from kintsugi.privacy import redact_sensitive_text, sanitize_runtime_value
+
 
 def smart_trim(value: Any, max_len: int = 3000) -> str:
-    """Safely convert value to string and trim if exceeding max_len to protect LLM context."""
-    s = repr(value)
-    if len(s) > max_len:
-        half = max_len // 2
-        return f"{s[:half]}\n... [TRUNCATED {len(s) - max_len} CHARS] ...\n{s[-half:]}"
-    return s
+    """Safely convert value to string, sanitize secrets, and trim if exceeding max_len."""
+    return sanitize_runtime_value(value, signature_only=False, max_len=max_len)
 
 
 def extract_function_source(func: Callable) -> str:
@@ -41,7 +39,6 @@ def get_schema_summary(schema: Optional[Type]) -> str:
     if schema is None:
         return "No explicit schema enforced. Return the intended logical data structure."
 
-    # If it's a Pydantic v2 BaseModel
     if hasattr(schema, "model_fields"):
         fields_desc = []
         for name, field in schema.model_fields.items():
@@ -60,8 +57,10 @@ def build_repair_prompt(
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
     schema: Optional[Type] = None,
+    signature_only: bool = False,
+    include_args: bool = True,
 ) -> Tuple[str, str]:
-    """Construct system prompt and user prompt for the LLM repair surgeon."""
+    """Construct system prompt and user prompt for the LLM repair surgeon with privacy scrubbing."""
     system_prompt = (
         "You are Kintsugi, an autonomous Python code repair surgeon.\n"
         "A runtime error occurred in a Python function.\n"
@@ -69,14 +68,23 @@ def build_repair_prompt(
         "STRICT OPERATIONAL RULES:\n"
         "1. Output ONLY executable Python code inside a ```python ... ``` block.\n"
         "2. Keep the EXACT same function name and signature.\n"
-        "3. Do NOT import destructive libraries (os, sys, subprocess, shutil, eval, exec).\n"
+        "3. Do NOT import destructive libraries (os, sys, subprocess, shutil, eval, exec, ctypes).\n"
         "4. The return value MUST match the target schema specification.\n"
         "5. No pleasantries, no conversational filler, no explanations."
     )
 
-    trimmed_args = [smart_trim(a) for a in args]
-    trimmed_kwargs = {k: smart_trim(v) for k, v in kwargs.items()}
+    if include_args:
+        trimmed_args = [sanitize_runtime_value(a, signature_only=signature_only) for a in args]
+        trimmed_kwargs = {
+            k: sanitize_runtime_value(v, signature_only=signature_only) for k, v in kwargs.items()
+        }
+        args_section = f"args: {trimmed_args}\nkwargs: {trimmed_kwargs}"
+    else:
+        args_section = "[Input arguments omitted by privacy policy]"
+
     schema_info = get_schema_summary(schema)
+    clean_exc_msg = redact_sensitive_text(str(exc))
+    clean_tb = redact_sensitive_text(tb_str)
 
     user_prompt = f"""### BROKEN FUNCTION: `{func.__name__}`
 
@@ -86,14 +94,13 @@ def build_repair_prompt(
 
 ### RUNTIME EXCEPTION:
 Type: {type(exc).__name__}
-Message: {str(exc)}
+Message: {clean_exc_msg}
 
 ### TRACEBACK:
-{tb_str}
+{clean_tb}
 
 ### INPUT ARGUMENTS AT CRASH:
-args: {trimmed_args}
-kwargs: {trimmed_kwargs}
+{args_section}
 
 ### REQUIRED OUTPUT CONTRACT:
 {schema_info}

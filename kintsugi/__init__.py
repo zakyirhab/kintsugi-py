@@ -1,13 +1,14 @@
 """
 KintsugiPy (金継ぎ)
 Self-healing Python functions powered by Universal LLMs.
-Zero-downtime execution with AST safety and in-memory hot-swapping.
+Zero-restart runtime healing with defense-in-depth AST safety and hot-swapping.
 """
 
 import os
 from typing import Any, Dict, List, Optional, Union
 
-from kintsugi.decorator import heal, HealReport
+from kintsugi.decorator import heal, HealReport, ProposedPatchError
+from kintsugi.privacy import redact_sensitive_text, sanitize_runtime_value
 from kintsugi.providers import (
     FallbackChainProvider,
     LLMProvider,
@@ -18,12 +19,15 @@ from kintsugi.providers import (
 )
 from kintsugi.sandbox import SecurityViolationError
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "heal",
     "HealReport",
+    "ProposedPatchError",
     "configure",
     "SecurityViolationError",
+    "redact_sensitive_text",
+    "sanitize_runtime_value",
     "LLMProvider",
     "OpenAILikeProvider",
     "AnthropicNativeProvider",

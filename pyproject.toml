@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kintsugi-py"
-version = "0.2.0"
-description = "Self-healing Python functions powered by Universal LLMs. Zero-downtime execution with AST safety and in-memory hot-swapping."
+version = "0.3.0"
+description = "Self-healing Python functions powered by Universal LLMs. Zero-restart runtime healing with defense-in-depth AST safety and hot-swapping."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-    { name = "Zaky Irhab", email = "emailmeforbussiness@zakyirhab.it.com" }
+    { name = "Zaky Irhab", email = "emailmeforbusiness@zakyirhab.it.com" }
 ]
 keywords = [
     "self-healing",

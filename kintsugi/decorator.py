@@ -1,7 +1,9 @@
 """
 Core @heal decorator and in-memory hot-swap engine for KintsugiPy.
-Includes Thundering Herd concurrency prevention (Double-Checked Locking)
-and rich observability telemetry (HealReport with unified diffs).
+Includes Thundering Herd concurrency prevention (Double-Checked Locking),
+rich observability telemetry (HealReport with unified diffs),
+propose-only enterprise mode, custom validation predicates,
+and dry-run timeout protection.
 """
 
 import asyncio
@@ -10,18 +12,44 @@ import difflib
 from functools import wraps
 import inspect
 import logging
+from pathlib import Path
 import sys
 import threading
 import time
 import traceback
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    ParamSpec,
+    Type,
+    TypeVar,
+    Union,
+)
 
 from kintsugi.cache import PatchCache, compute_fingerprint
 from kintsugi.inspector import build_repair_prompt, extract_function_source
 from kintsugi.providers import LLMProvider, resolve_provider
-from kintsugi.sandbox import compile_and_extract_function, validate_contract
+from kintsugi.sandbox import (
+    compile_and_extract_function,
+    execute_with_timeout,
+    validate_contract,
+)
 
 logger = logging.getLogger("kintsugi")
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+class ProposedPatchError(RuntimeError):
+    """Raised in mode='propose' when an autonomous repair is validated and proposed for human review."""
+
+    def __init__(self, message: str, report: "HealReport") -> None:
+        super().__init__(message)
+        self.report = report
 
 
 @dataclass
@@ -125,6 +153,13 @@ async def _adispatch_on_heal(
 
 def heal(
     schema: Optional[Type] = None,
+    validate: Optional[Callable[[Any], bool]] = None,
+    mode: str = "auto",
+    idempotent: bool = True,
+    dry_run: bool = True,
+    dry_run_timeout: float = 5.0,
+    signature_only: bool = False,
+    include_args: bool = True,
     max_retries: int = 3,
     provider: Optional[str] = None,
     model: Optional[str] = None,
@@ -134,29 +169,30 @@ def heal(
     cache_dir: Optional[str] = ".kintsugi_cache",
     chain: Optional[List[Union[dict, LLMProvider]]] = None,
     on_heal: Optional[Callable[[Any], Any]] = None,
-) -> Callable:
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator that empowers Python functions with autonomous self-healing capabilities."""
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: Callable[P, R]) -> Callable[P, R]:
         state = FunctionState(func, schema)
         cache = PatchCache(cache_dir)
         is_coroutine = inspect.iscoroutinefunction(func)
 
-        # 1. Cold-start check: Rehydrate from disk cache if a patch already exists
-        cached_patch = cache.load_patch(state.func_name, state.fingerprint)
-        if cached_patch:
-            try:
-                fn_globals = getattr(func, "__globals__", {})
-                rehydrated_fn = compile_and_extract_function(
-                    cached_patch, state.func_name, fn_globals
-                )
-                state.active_func = rehydrated_fn
-                state.is_healed = True
-                state.last_patch_code = cached_patch
-                logger.info("[Kintsugi] Rehydrated '%s' from disk cache.", state.func_name)
-            except Exception as e:
-                logger.warning("[Kintsugi] Failed to rehydrate '%s' from cache: %s", state.func_name, e)
-                state.active_func = func
+        # 1. Cold-start check: Rehydrate from disk cache if a patch already exists and mode == 'auto'
+        if mode == "auto":
+            cached_patch = cache.load_patch(state.func_name, state.fingerprint)
+            if cached_patch:
+                try:
+                    fn_globals = getattr(func, "__globals__", {})
+                    rehydrated_fn = compile_and_extract_function(
+                        cached_patch, state.func_name, fn_globals
+                    )
+                    state.active_func = rehydrated_fn
+                    state.is_healed = True
+                    state.last_patch_code = cached_patch
+                    logger.info("[Kintsugi] Rehydrated '%s' from disk cache.", state.func_name)
+                except Exception as e:
+                    logger.warning("[Kintsugi] Failed to rehydrate '%s' from cache: %s", state.func_name, e)
+                    state.active_func = func
 
         def get_provider() -> LLMProvider:
             return resolve_provider(
@@ -170,30 +206,28 @@ def heal(
 
         if is_coroutine:
             @wraps(func)
-            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                # Fast path: Execute active function without acquiring lock
+            async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
                 initial_exc = None
                 try:
                     result = await state.active_func(*args, **kwargs)
-                    return validate_contract(result, schema)
+                    return validate_contract(result, schema, predicate=validate)
                 except Exception as exc:
                     initial_exc = exc
 
                 # Double-Checked Locking: Acquire async lock to prevent Thundering Herd
                 async with state.async_lock:
-                    # Check #2: Did another concurrent task already heal this function
-                    # while this task was waiting for the lock?
-                    if state.is_healed:
+                    if state.is_healed and mode == "auto":
                         try:
                             result = await state.active_func(*args, **kwargs)
-                            return validate_contract(result, schema)
+                            return validate_contract(result, schema, predicate=validate)
                         except Exception as retry_exc:
                             initial_exc = retry_exc
 
                     logger.warning(
-                        "[Kintsugi] Unhandled exception in '%s': %s. Initiating repair cycle...",
+                        "[Kintsugi] Error in '%s': %s. Initiating repair cycle (mode='%s')...",
                         state.func_name,
                         initial_exc,
+                        mode,
                     )
                     active_provider = get_provider()
                     current_exc = initial_exc
@@ -221,6 +255,8 @@ def heal(
                             args=args,
                             kwargs=kwargs,
                             schema=schema,
+                            signature_only=signature_only,
+                            include_args=include_args,
                         )
 
                         try:
@@ -234,19 +270,50 @@ def heal(
                                 patch_code, state.func_name, fn_globals
                             )
 
-                            # 3. Dry-run test with failing inputs
-                            raw_result = await candidate_fn(*args, **kwargs)
+                            # 3. Dry-run test with failing inputs if idempotent
+                            if dry_run and idempotent:
+                                raw_result = await asyncio.wait_for(
+                                    candidate_fn(*args, **kwargs),
+                                    timeout=dry_run_timeout,
+                                )
+                                validated_result = validate_contract(
+                                    raw_result, schema, predicate=validate
+                                )
+                            else:
+                                validated_result = None
 
-                            # 4. Validate output contract
-                            validated_result = validate_contract(raw_result, schema)
+                            report = HealReport.create(
+                                func_name=state.func_name,
+                                initial_exc=initial_exc,
+                                tb_str=tb_str,
+                                original_code=state.source_code,
+                                healed_code=patch_code,
+                                attempts=attempt,
+                                provider=active_provider.__class__.__name__,
+                                model=active_provider.model,
+                            )
 
-                            # 5. Hot-swap in memory!
+                            if on_heal:
+                                await _adispatch_on_heal(on_heal, report, patch_code)
+
+                            # If mode == 'propose', do not hot-swap or return result
+                            if mode == "propose":
+                                logger.info(
+                                    "[Kintsugi] Validated patch proposal for '%s'. Halting execution as mode='propose'.",
+                                    state.func_name,
+                                )
+                                raise ProposedPatchError(
+                                    f"Patch proposed for '{state.func_name}' but not applied (mode='propose').",
+                                    report=report,
+                                )
+
+                            # 4. Mode == 'auto': Hot-swap in memory!
                             state.active_func = candidate_fn
                             state.is_healed = True
                             state.heal_count += 1
                             state.last_patch_code = patch_code
 
-                            # 6. Save to cache
+                            # 5. Save to disk cache
                             cache.save_patch(
                                 state.func_name,
                                 state.fingerprint,
@@ -265,21 +332,12 @@ def heal(
                                 attempt,
                             )
 
-                            if on_heal:
-                                report = HealReport.create(
-                                    func_name=state.func_name,
-                                    initial_exc=initial_exc,
-                                    tb_str=tb_str,
-                                    original_code=state.source_code,
-                                    healed_code=patch_code,
-                                    attempts=attempt,
-                                    provider=active_provider.__class__.__name__,
-                                    model=active_provider.model,
-                                )
-                                await _adispatch_on_heal(on_heal, report, patch_code)
+                            if validated_result is not None:
+                                return validated_result
+                            return await candidate_fn(*args, **kwargs)
 
-                            return validated_result
-
+                        except ProposedPatchError:
+                            raise
                         except Exception as repair_exc:
                             logger.warning(
                                 "[Kintsugi] Attempt %d to heal '%s' failed: %s",
@@ -303,29 +361,28 @@ def heal(
 
         else:
             @wraps(func)
-            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                # Fast path: Execute active function without acquiring lock
+            def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
                 initial_exc = None
                 try:
                     result = state.active_func(*args, **kwargs)
-                    return validate_contract(result, schema)
+                    return validate_contract(result, schema, predicate=validate)
                 except Exception as exc:
                     initial_exc = exc
 
-                # Double-Checked Locking: Acquire threading lock to prevent multi-threaded race conditions
+                # Double-Checked Locking: Acquire threading lock to prevent race conditions
                 with state.sync_lock:
-                    # Check #2: Did another concurrent thread already heal this function?
-                    if state.is_healed:
+                    if state.is_healed and mode == "auto":
                         try:
                             result = state.active_func(*args, **kwargs)
-                            return validate_contract(result, schema)
+                            return validate_contract(result, schema, predicate=validate)
                         except Exception as retry_exc:
                             initial_exc = retry_exc
 
                     logger.warning(
-                        "[Kintsugi] Unhandled exception in '%s': %s. Initiating repair cycle...",
+                        "[Kintsugi] Error in '%s': %s. Initiating repair cycle (mode='%s')...",
                         state.func_name,
                         initial_exc,
+                        mode,
                     )
                     active_provider = get_provider()
                     current_exc = initial_exc
@@ -353,6 +410,8 @@ def heal(
                             args=args,
                             kwargs=kwargs,
                             schema=schema,
+                            signature_only=signature_only,
+                            include_args=include_args,
                         )
 
                         try:
@@ -366,19 +425,49 @@ def heal(
                                 patch_code, state.func_name, fn_globals
                             )
 
-                            # 3. Dry-run test with failing inputs
-                            raw_result = candidate_fn(*args, **kwargs)
+                            # 3. Dry-run test with failing inputs if idempotent
+                            if dry_run and idempotent:
+                                raw_result = execute_with_timeout(
+                                    candidate_fn, args, kwargs, timeout_sec=dry_run_timeout
+                                )
+                                validated_result = validate_contract(
+                                    raw_result, schema, predicate=validate
+                                )
+                            else:
+                                validated_result = None
 
-                            # 4. Validate output contract
-                            validated_result = validate_contract(raw_result, schema)
+                            report = HealReport.create(
+                                func_name=state.func_name,
+                                initial_exc=initial_exc,
+                                tb_str=tb_str,
+                                original_code=state.source_code,
+                                healed_code=patch_code,
+                                attempts=attempt,
+                                provider=active_provider.__class__.__name__,
+                                model=active_provider.model,
+                            )
 
-                            # 5. Hot-swap in memory!
+                            if on_heal:
+                                _dispatch_on_heal(on_heal, report, patch_code)
+
+                            # If mode == 'propose', do not hot-swap or return result
+                            if mode == "propose":
+                                logger.info(
+                                    "[Kintsugi] Validated patch proposal for '%s'. Halting execution as mode='propose'.",
+                                    state.func_name,
+                                )
+                                raise ProposedPatchError(
+                                    f"Patch proposed for '{state.func_name}' but not applied (mode='propose').",
+                                    report=report,
+                                )
+
+                            # 4. Mode == 'auto': Hot-swap in memory!
                             state.active_func = candidate_fn
                             state.is_healed = True
                             state.heal_count += 1
                             state.last_patch_code = patch_code
 
-                            # 6. Save to cache
+                            # 5. Save to disk cache
                             cache.save_patch(
                                 state.func_name,
                                 state.fingerprint,
@@ -397,21 +486,12 @@ def heal(
                                 attempt,
                             )
 
-                            if on_heal:
-                                report = HealReport.create(
-                                    func_name=state.func_name,
-                                    initial_exc=initial_exc,
-                                    tb_str=tb_str,
-                                    original_code=state.source_code,
-                                    healed_code=patch_code,
-                                    attempts=attempt,
-                                    provider=active_provider.__class__.__name__,
-                                    model=active_provider.model,
-                                )
-                                _dispatch_on_heal(on_heal, report, patch_code)
+                            if validated_result is not None:
+                                return validated_result
+                            return candidate_fn(*args, **kwargs)
 
-                            return validated_result
-
+                        except ProposedPatchError:
+                            raise
                         except Exception as repair_exc:
                             logger.warning(
                                 "[Kintsugi] Attempt %d to heal '%s' failed: %s",

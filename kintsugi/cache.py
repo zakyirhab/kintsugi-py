@@ -1,15 +1,19 @@
 """
 Patch Cache & Cold Start Rehydration for KintsugiPy.
 Saves and loads validated patches to disk (.kintsugi_cache/) for zero-token re-runs.
-Includes AST-aware fingerprinting and stale cache pruning.
+Includes AST-aware fingerprinting, auto-.gitignore, HMAC integrity checks,
+and stale cache pruning.
 """
 
 import ast
 import hashlib
+import hmac
 import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from kintsugi.sandbox import verify_code_safety
 
 logger = logging.getLogger("kintsugi.cache")
 
@@ -22,26 +26,41 @@ def compute_fingerprint(func_name: str, source_code: str) -> str:
     """
     try:
         tree = ast.parse(source_code)
-        # ast.dump without line numbers/attributes ensures pure structural comparison
         normalized = ast.dump(tree, annotate_fields=False, include_attributes=False)
         raw = f"{func_name}::{normalized}"
     except Exception:
-        # Fallback to trimmed text if AST parsing fails
         raw = f"{func_name}::{source_code.strip()}"
 
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def compute_patch_checksum(code: str, secret: str = "kintsugi_default_salt") -> str:
+    """Compute a cryptographic HMAC-SHA256 checksum to detect external tampering of patch files."""
+    return hmac.new(secret.encode("utf-8"), code.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 class PatchCache:
-    """Manages reading, writing, and pruning healed patches on disk."""
+    """Manages reading, writing, integrity verification, and pruning healed patches on disk."""
 
     def __init__(self, cache_dir: Optional[str] = ".kintsugi_cache") -> None:
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self._ensure_gitignore()
 
     def is_enabled(self) -> bool:
         return self.cache_dir is not None
+
+    def _ensure_gitignore(self) -> None:
+        """Ensure .kintsugi_cache directory contains a .gitignore file so patches are not committed."""
+        if not self.cache_dir:
+            return
+        gi_file = self.cache_dir / ".gitignore"
+        if not gi_file.exists():
+            try:
+                gi_file.write_text("*\n", encoding="utf-8")
+            except Exception:
+                pass
 
     def _get_patch_file(self, func_name: str, fingerprint: str) -> Path:
         return self.cache_dir / f"{func_name}_{fingerprint}.py"
@@ -50,19 +69,41 @@ class PatchCache:
         return self.cache_dir / f"{func_name}_{fingerprint}.json"
 
     def load_patch(self, func_name: str, fingerprint: str) -> Optional[str]:
-        """Load code patch from disk if it exists and matches the current fingerprint."""
+        """Load code patch from disk if it exists, passes HMAC integrity, and passes AST guardrails."""
         if not self.is_enabled():
             return None
 
-        # Clean up any stale/orphaned patches from older versions of this function
+        # Clean up any stale patches
         self.prune_stale_patches(func_name, fingerprint)
 
         patch_file = self._get_patch_file(func_name, fingerprint)
+        meta_file = self._get_meta_file(func_name, fingerprint)
+
         if patch_file.exists():
             try:
-                return patch_file.read_text(encoding="utf-8")
-            except Exception:
+                code = patch_file.read_text(encoding="utf-8")
+
+                # 1. Integrity check via metadata HMAC
+                if meta_file.exists():
+                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                    expected_checksum = meta.get("checksum")
+                    if expected_checksum:
+                        actual_checksum = compute_patch_checksum(code)
+                        if not hmac.compare_digest(expected_checksum, actual_checksum):
+                            logger.warning(
+                                "[Kintsugi] Cache integrity mismatch for '%s'. Rejecting tampered patch.",
+                                func_name,
+                            )
+                            return None
+
+                # 2. Defense-in-depth: Re-verify code safety through AST guardrail
+                verify_code_safety(code, func_name)
+                return code
+
+            except Exception as e:
+                logger.warning("[Kintsugi] Failed to load/verify cached patch for '%s': %s", func_name, e)
                 return None
+
         return None
 
     def save_patch(
@@ -72,21 +113,24 @@ class PatchCache:
         code: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Save healed code patch and metadata to disk, pruning obsolete versions."""
+        """Save healed code patch and metadata with HMAC integrity to disk."""
         if not self.is_enabled():
             return False
 
         try:
-            # Clean up older patches for this function
             self.prune_stale_patches(func_name, fingerprint)
 
             patch_file = self._get_patch_file(func_name, fingerprint)
             patch_file.write_text(code, encoding="utf-8")
 
-            if metadata:
-                meta_file = self._get_meta_file(func_name, fingerprint)
-                meta_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            meta = dict(metadata or {})
+            meta["checksum"] = compute_patch_checksum(code)
+            meta["fingerprint"] = fingerprint
+
+            meta_file = self._get_meta_file(func_name, fingerprint)
+            meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             return True
+
         except Exception as e:
             logger.warning("[Kintsugi] Failed to write cache patch: %s", e)
             return False
