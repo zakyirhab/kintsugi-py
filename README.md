@@ -8,6 +8,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/zakyirhab/kintsugi-py/blob/main/LICENSE)
 [![Tests](https://img.shields.io/badge/tests-30%20passed-brightgreen.svg)]()
 
+<p align="center">
+  <img src="assets/demo.gif" alt="KintsugiPy Autonomous Runtime Repair Demo" width="850">
+</p>
+
 **KintsugiPy** is an autonomous, self-healing runtime engine for Python functions powered by Universal LLMs. When a function encounters an unhandled exception or upstream schema drift (e.g. web scraping layout changes, third-party API mutations, malformed dirty payloads), KintsugiPy:
 
 1. **Captures Crime Scene Telemetry**: Extracts function AST source, local variables, traceback, and execution context.
