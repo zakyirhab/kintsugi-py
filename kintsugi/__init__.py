@@ -7,7 +7,7 @@ Zero-downtime execution with AST safety and in-memory hot-swapping.
 import os
 from typing import Any, Dict, List, Optional, Union
 
-from kintsugi.decorator import heal
+from kintsugi.decorator import heal, HealReport
 from kintsugi.providers import (
     FallbackChainProvider,
     LLMProvider,
@@ -18,9 +18,10 @@ from kintsugi.providers import (
 )
 from kintsugi.sandbox import SecurityViolationError
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "heal",
+    "HealReport",
     "configure",
     "SecurityViolationError",
     "LLMProvider",

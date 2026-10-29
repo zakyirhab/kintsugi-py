@@ -6,6 +6,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/kintsugi-py.svg?color=blue)](https://pypi.org/project/kintsugi-py/)
 [![Python versions](https://img.shields.io/pypi/pyversions/kintsugi-py.svg)](https://pypi.org/project/kintsugi-py/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/zakyirhab/kintsugi-py/blob/main/LICENSE)
+[![Tests](https://img.shields.io/badge/tests-30%20passed-brightgreen.svg)]()
 
 **KintsugiPy** is an autonomous, self-healing runtime engine for Python functions powered by Universal LLMs. When a function encounters an unhandled exception or upstream schema drift (e.g. web scraping layout changes, third-party API mutations, malformed dirty payloads), KintsugiPy:
 
@@ -21,9 +22,12 @@
 ## ⚡ Key Highlights
 
 - **Zero Heavy Vendor SDKs**: Engineered cleanly on top of `httpx` and `pydantic`. No bloated 500MB cloud client packages.
+- **Thundering Herd Concurrency Shield**: Built-in **Double-Checked Locking** (`asyncio.Lock` & `threading.Lock`). When 50 concurrent tasks fail simultaneously in `asyncio.gather()`, exactly **1** LLM repair call is made—the other 49 tasks wait and seamlessly reuse the hot-swapped function.
+- **Rich Observability Telemetry**: Inspect runtime repairs with `HealReport`, providing unified git-style code diffs, root-cause tracebacks, attempt counts, and provider metadata.
+- **AST-Aware Caching & Stale Pruning**: Ignores comments and whitespace variations when hashing, avoiding false cache invalidations. Obsolete patch versions are automatically cleaned up from `.kintsugi_cache/`.
 - **Universal Provider Engine**: Direct REST wire adapters for Anthropic (`/v1/messages`), Google Gemini (`generateContent`), OpenAI-compatible endpoints (`/v1/chat/completions`), and local runtimes (LM Studio, Ollama, vLLM).
 - **Multi-Provider Fallback Chain**: Automatically cascade from Local LLM $\rightarrow$ Groq $\rightarrow$ Claude $\rightarrow$ OpenAI if an endpoint is unreachable or rate-limited.
-- **Zero Overhead on Normal Execution**: Healthy function invocations run at native Python C-speed. The healer decorator does not inspect or alter execution unless an exception is raised.
+- **Zero Overhead on Normal Execution**: Healthy function invocations run at native Python C-speed.
 - **Dual Sync & Async Core**: Seamlessly heals standard functions (`def`) and asynchronous coroutines (`async def`).
 
 ---
@@ -167,6 +171,51 @@ async def fetch_stock_quote(symbol: str) -> dict:
 
 ---
 
+### 6. Observability & Telemetry (`HealReport`)
+
+Receive instant notifications (Slack, Discord, Telegram, or logs) with a unified git-style diff whenever a function heals itself in production:
+
+```python
+from kintsugi import heal, HealReport
+
+async def alert_engineering_team(report: HealReport):
+    message = (
+        f"🚨 Function `{report.func_name}` auto-healed in production!\n"
+        f"Caused by: {report.error_type}: {report.error_message}\n"
+        f"Provider: {report.provider} ({report.model}) in {report.attempts} attempt(s)\n\n"
+        f"```diff\n{report.diff}\n```"
+    )
+    # Send to your monitoring webhook or message queue
+    print(message)
+
+@heal(on_heal=alert_engineering_team)
+async def process_batch_payloads(data: dict):
+    ...
+```
+
+---
+
+### 7. Thundering Herd Concurrency Shield
+
+When executing high-concurrency workloads with `asyncio.gather()` or worker threads, upstream schema changes can cause dozens of tasks to crash in the same millisecond.
+
+KintsugiPy implements **Double-Checked Locking**. Only the first arriving task acquires the healing lock and requests an LLM patch. All other concurrent tasks wait on the lock and immediately execute the hot-swapped function upon release—**eliminating token waste and rate-limit spikes**:
+
+```python
+import asyncio
+from kintsugi import heal
+
+@heal()
+async def query_endpoint(item_id: int):
+    ...
+
+# 100 concurrent tasks crash at the same time:
+# Result: Exactly 1 LLM repair request made; all 100 tasks succeed!
+results = await asyncio.gather(*(query_endpoint(i) for i in range(100)))
+```
+
+---
+
 ## 🛡️ AST Safety Guardrail
 
 Allowing an LLM to generate code at runtime requires uncompromised security. Kintsugi inspects the parsed Abstract Syntax Tree (AST) of every candidate patch before compilation:
@@ -196,7 +245,7 @@ Allowing an LLM to generate code at runtime requires uncompromised security. Kin
 | `timeout` | `float` | `30.0` | Network request timeout in seconds. |
 | `cache_dir` | `str` / `None` | `".kintsugi_cache"` | Directory for persisted code patches. Set `None` to disable disk caching. |
 | `chain` | `List[dict \| LLMProvider]` | `None` | Ordered list of fallback providers. |
-| `on_heal` | `Callable[[str, str], None]` | `None` | Event callback triggered when a function is healed: `on_heal(func_name, patch_code)`. |
+| `on_heal` | `Callable[[HealReport], Any]` | `None` | Event callback triggered when a function is healed. Receives `HealReport` (with `.diff`, `.error_type`, `.attempts`, etc.) or legacy `(func_name, patch_code)`. |
 
 ---
 
