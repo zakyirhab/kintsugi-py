@@ -19,7 +19,7 @@ from kintsugi.providers import (
 )
 from kintsugi.sandbox import SecurityViolationError
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __all__ = [
     "heal",
     "HealReport",

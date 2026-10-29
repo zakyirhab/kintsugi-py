@@ -46,9 +46,11 @@ def parse_id(data: dict) -> int:
     assert not parse_id.__kintsugi_state__.is_healed
     assert parse_id.__kintsugi_state__.active_func == parse_id.__kintsugi_state__.original_func
 
-    # 3. Subsequent calls with missing 'id' still fail in original function
+    # 3. Subsequent calls with missing 'id' re-raise ProposedPatchError using cached proposal (cooldown)
+    # CRITICAL: Surgeon must NOT be called again! calls must remain 1.
     with pytest.raises(ProposedPatchError):
         parse_id({"uuid": 99})
+    assert surgeon.calls == 1
 
 
 @pytest.mark.asyncio

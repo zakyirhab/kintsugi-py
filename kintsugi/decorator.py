@@ -31,6 +31,7 @@ from typing import (
 
 from kintsugi.cache import PatchCache, compute_fingerprint
 from kintsugi.inspector import build_repair_prompt, extract_function_source
+from kintsugi.privacy import redact_sensitive_text
 from kintsugi.providers import LLMProvider, resolve_provider
 from kintsugi.sandbox import (
     compile_and_extract_function,
@@ -91,11 +92,11 @@ class HealReport:
         return cls(
             func_name=func_name,
             error_type=type(initial_exc).__name__,
-            error_message=str(initial_exc),
-            traceback=tb_str,
-            original_code=original_code,
-            healed_code=healed_code,
-            diff="".join(diff_lines),
+            error_message=redact_sensitive_text(str(initial_exc)),
+            traceback=redact_sensitive_text(tb_str),
+            original_code=redact_sensitive_text(original_code),
+            healed_code=redact_sensitive_text(healed_code),
+            diff=redact_sensitive_text("".join(diff_lines)),
             attempts=attempts,
             provider=provider,
             model=model,
@@ -116,6 +117,8 @@ class FunctionState:
         self.is_healed = False
         self.heal_count = 0
         self.last_patch_code: Optional[str] = None
+        self.last_proposed_report: Optional[HealReport] = None
+        self.last_proposed_time: float = 0.0
         self.sync_lock = threading.Lock()
         self._async_lock: Optional[asyncio.Lock] = None
 
@@ -155,6 +158,7 @@ def heal(
     schema: Optional[Type] = None,
     validate: Optional[Callable[[Any], bool]] = None,
     mode: str = "auto",
+    propose_cooldown: float = 300.0,
     idempotent: bool = True,
     dry_run: bool = True,
     dry_run_timeout: float = 5.0,
@@ -222,6 +226,20 @@ def heal(
                             return validate_contract(result, schema, predicate=validate)
                         except Exception as retry_exc:
                             initial_exc = retry_exc
+
+                    # Cooldown deduplication in propose mode to prevent burning LLM calls
+                    if mode == "propose" and state.last_proposed_report is not None:
+                        elapsed = time.time() - state.last_proposed_time
+                        if elapsed < propose_cooldown:
+                            logger.debug(
+                                "[Kintsugi] Returning cached proposal for '%s' (cooldown active: %.1fs remaining).",
+                                state.func_name,
+                                propose_cooldown - elapsed,
+                            )
+                            raise ProposedPatchError(
+                                f"Patch proposed for '{state.func_name}' but not applied (mode='propose').",
+                                report=state.last_proposed_report,
+                            )
 
                     logger.warning(
                         "[Kintsugi] Error in '%s': %s. Initiating repair cycle (mode='%s')...",
@@ -296,8 +314,10 @@ def heal(
                             if on_heal:
                                 await _adispatch_on_heal(on_heal, report, patch_code)
 
-                            # If mode == 'propose', do not hot-swap or return result
+                            # If mode == 'propose', record proposal for cooldown deduplication and do not hot-swap
                             if mode == "propose":
+                                state.last_proposed_report = report
+                                state.last_proposed_time = time.time()
                                 logger.info(
                                     "[Kintsugi] Validated patch proposal for '%s'. Halting execution as mode='propose'.",
                                     state.func_name,
@@ -378,6 +398,20 @@ def heal(
                         except Exception as retry_exc:
                             initial_exc = retry_exc
 
+                    # Cooldown deduplication in propose mode to prevent burning LLM calls
+                    if mode == "propose" and state.last_proposed_report is not None:
+                        elapsed = time.time() - state.last_proposed_time
+                        if elapsed < propose_cooldown:
+                            logger.debug(
+                                "[Kintsugi] Returning cached proposal for '%s' (cooldown active: %.1fs remaining).",
+                                state.func_name,
+                                propose_cooldown - elapsed,
+                            )
+                            raise ProposedPatchError(
+                                f"Patch proposed for '{state.func_name}' but not applied (mode='propose').",
+                                report=state.last_proposed_report,
+                            )
+
                     logger.warning(
                         "[Kintsugi] Error in '%s': %s. Initiating repair cycle (mode='%s')...",
                         state.func_name,
@@ -450,8 +484,10 @@ def heal(
                             if on_heal:
                                 _dispatch_on_heal(on_heal, report, patch_code)
 
-                            # If mode == 'propose', do not hot-swap or return result
+                            # If mode == 'propose', record proposal for cooldown deduplication and do not hot-swap
                             if mode == "propose":
+                                state.last_proposed_report = report
+                                state.last_proposed_time = time.time()
                                 logger.info(
                                     "[Kintsugi] Validated patch proposal for '%s'. Halting execution as mode='propose'.",
                                     state.func_name,

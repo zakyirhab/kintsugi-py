@@ -194,9 +194,10 @@ def validate_contract(
     # 1. Custom predicate evaluation (e.g. lambda res: len(res) > 0)
     if predicate is not None:
         try:
-            is_valid = predicate(result)
-        except Exception as pred_exc:
-            raise ValueError(f"Custom validation predicate raised an exception: {pred_exc}") from pred_exc
+            is_valid = bool(predicate(result))
+        except Exception:
+            # If predicate raises an exception (e.g. TypeError on object without len), treat gracefully as validation failure
+            is_valid = False
         if not is_valid:
             raise ValueError(f"Return value failed custom validation predicate: {repr(result)}")
 

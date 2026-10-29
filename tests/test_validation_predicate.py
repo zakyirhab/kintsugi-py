@@ -57,3 +57,26 @@ def scrape_items(html: str) -> list:
     res3 = scrape_items('<div class="product">Headset</div>')
     assert res3 == ["Headset"]
     assert surgeon.calls == 1
+
+
+def test_predicate_exception_treated_as_validation_failure():
+    # If function returns an int (0) and predicate tries len(x), TypeError occurs.
+    # Kintsugi must handle TypeError gracefully as failure, trigger healing, and succeed.
+    repaired_code = """
+def get_tags(d: dict) -> list:
+    return ["tag1", "tag2"]
+"""
+    surgeon = MockPredicateSurgeon(repaired_code)
+
+    @heal(
+        validate=lambda x: len(x) > 0,  # len(0) will raise TypeError
+        chain=[surgeon],
+        cache_dir=None,
+    )
+    def get_tags(d: dict):
+        return 0  # Invalid int instead of container
+
+    # Must heal gracefully without blowing up on TypeError
+    res = get_tags({})
+    assert res == ["tag1", "tag2"]
+    assert surgeon.calls == 1

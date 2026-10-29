@@ -38,8 +38,8 @@ if __name__ == "__main__":
     # Payload contains dirty/changed keys and sensitive customer tokens
     raw_payload = {
         "items": ["Laser Scanner 3D", "Robotic Arm v2"],
-        "customer_api_key": "sk-production_super_secret_token_1234567890",
-        "customer_email": "admin@defense-contractor.gov",
+        "customer_api_key": "sk-FAKE-EXAMPLE-TOKEN-XYZ",
+        "customer_email": "user@example.com",
     }
 
     try:

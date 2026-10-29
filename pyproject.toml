@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kintsugi-py"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Self-healing Python functions powered by Universal LLMs. Zero-restart runtime healing with defense-in-depth AST safety and hot-swapping."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -51,6 +51,9 @@ Documentation = "https://github.com/zakyirhab/kintsugi-py#readme"
 Repository = "https://github.com/zakyirhab/kintsugi-py"
 Issues = "https://github.com/zakyirhab/kintsugi-py/issues"
 Changelog = "https://github.com/zakyirhab/kintsugi-py/releases"
+
+[tool.hatch.version]
+path = "kintsugi/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kintsugi"]
