@@ -7,7 +7,7 @@ Zero-restart runtime healing with defense-in-depth AST safety and hot-swapping.
 import os
 from typing import Any, Dict, List, Optional, Union
 
-from kintsugi.decorator import heal, HealReport, ProposedPatchError
+from kintsugi.decorator import DEFAULT_HEAL_EXCEPTIONS, heal, HealReport, ProposedPatchError
 from kintsugi.privacy import redact_sensitive_text, sanitize_runtime_value
 from kintsugi.providers import (
     FallbackChainProvider,
@@ -19,11 +19,12 @@ from kintsugi.providers import (
 )
 from kintsugi.sandbox import SecurityViolationError
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 __all__ = [
     "heal",
     "HealReport",
     "ProposedPatchError",
+    "DEFAULT_HEAL_EXCEPTIONS",
     "configure",
     "SecurityViolationError",
     "redact_sensitive_text",

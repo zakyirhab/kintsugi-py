@@ -45,7 +45,7 @@ def test_build_repair_prompt_privacy_options():
     def dummy_func(token: str, data: dict):
         pass
 
-    sys_p, user_p = build_repair_prompt(
+    sys_p, user_p, secret_map = build_repair_prompt(
         func=dummy_func,
         source_code="def dummy_func(token, data): pass",
         exc=ValueError("Invalid sk-secretkey1234567890abcdef"),

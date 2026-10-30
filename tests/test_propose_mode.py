@@ -75,3 +75,59 @@ async def async_fetch(d: dict) -> str:
     assert len(captured) == 1
     assert captured[0].func_name == "async_fetch"
     assert not async_fetch.__kintsugi_state__.is_healed
+
+
+@pytest.mark.asyncio
+async def test_mode_propose_concurrency_50_calls_exactly_1_surgeon_call():
+    import asyncio
+
+    repaired_code = """
+async def concurrent_fetch(d: dict) -> str:
+    return d.get("data", "safe")
+"""
+    surgeon = MockProposeSurgeon(repaired_code)
+
+    @heal(mode="propose", chain=[surgeon], cache_dir=None)
+    async def concurrent_fetch(d: dict) -> str:
+        return d["data"]
+
+    # 50 concurrent tasks all crash simultaneously on KeyError
+    tasks = [concurrent_fetch({"missing": i}) for i in range(50)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # All 50 tasks must receive ProposedPatchError
+    assert len(results) == 50
+    for r in results:
+        assert isinstance(r, ProposedPatchError)
+
+    # Exactly 1 repair call must be made to the LLM; the other 49 reuse the proposal!
+    assert surgeon.calls == 1
+
+
+def test_mode_propose_does_not_mask_different_error_type():
+    repaired_code = """
+def process_data(d: dict, flag: bool) -> int:
+    if flag:
+        return int(d.get("val", 0))
+    return int(d.get("other", 1))
+"""
+    surgeon = MockProposeSurgeon(repaired_code)
+
+    @heal(mode="propose", chain=[surgeon], cache_dir=None)
+    def process_data(d: dict, flag: bool) -> int:
+        if flag:
+            return d["val"]  # KeyError
+        return 10 // d.get("div", 0)  # ZeroDivisionError
+
+    # 1. Trigger KeyError
+    with pytest.raises(ProposedPatchError) as exc_info1:
+        process_data({}, True)
+    assert exc_info1.value.report.error_type == "KeyError"
+    assert surgeon.calls == 1
+
+    # 2. Trigger ZeroDivisionError within cooldown
+    # Must NOT return cached KeyError proposal! Must process ZeroDivisionError independently.
+    with pytest.raises(ProposedPatchError) as exc_info2:
+        process_data({"val": 5, "div": 0}, False)
+    assert exc_info2.value.report.error_type == "ZeroDivisionError"
+    assert surgeon.calls == 2

@@ -7,6 +7,7 @@ and dry-run timeout protection.
 """
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass
 import difflib
 from functools import wraps
@@ -24,6 +25,7 @@ from typing import (
     List,
     Optional,
     ParamSpec,
+    Tuple,
     Type,
     TypeVar,
     Union,
@@ -31,7 +33,7 @@ from typing import (
 
 from kintsugi.cache import PatchCache, compute_fingerprint
 from kintsugi.inspector import build_repair_prompt, extract_function_source
-from kintsugi.privacy import redact_sensitive_text
+from kintsugi.privacy import redact_sensitive_text, restore_mapped_secrets
 from kintsugi.providers import LLMProvider, resolve_provider
 from kintsugi.sandbox import (
     compile_and_extract_function,
@@ -43,6 +45,50 @@ logger = logging.getLogger("kintsugi")
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+DEFAULT_HEAL_EXCEPTIONS: Tuple[Type[Exception], ...] = (
+    KeyError,
+    IndexError,
+    TypeError,
+    AttributeError,
+    ValueError,
+    ZeroDivisionError,
+)
+try:
+    from pydantic import ValidationError
+    DEFAULT_HEAL_EXCEPTIONS = DEFAULT_HEAL_EXCEPTIONS + (ValidationError,)
+except ImportError:
+    pass
+
+
+def extract_error_key(func: Callable, exc: Exception, fingerprint: str = "") -> str:
+    """Generate a deterministic error key based on qualname, fingerprint, error type, and innermost frame."""
+    exc_type = type(exc).__name__
+    tb = exc.__traceback__
+    qualname = getattr(func, "__qualname__", getattr(func, "__name__", "unknown"))
+    func_name = getattr(func, "__name__", "")
+    filename = getattr(getattr(func, "__code__", None), "co_filename", None)
+
+    matched_frame = None
+    curr = tb
+    while curr is not None:
+        f = curr.tb_frame
+        if f.f_code.co_name == func_name or (filename and f.f_code.co_filename == filename):
+            matched_frame = curr
+        curr = curr.tb_next
+
+    fp_tag = f":{fingerprint}" if fingerprint else ""
+    if matched_frame is not None:
+        frame_file = Path(matched_frame.tb_frame.f_code.co_filename).name
+        return f"{qualname}{fp_tag}:{exc_type}:{frame_file}:{matched_frame.tb_lineno}"
+
+    if tb:
+        extracted = traceback.extract_tb(tb)
+        if extracted:
+            last = extracted[-1]
+            return f"{qualname}{fp_tag}:{exc_type}:{Path(last.filename).name}:{last.lineno}"
+
+    return f"{qualname}{fp_tag}:{exc_type}:{str(exc)[:50]}"
 
 
 class ProposedPatchError(RuntimeError):
@@ -107,20 +153,41 @@ class HealReport:
 class FunctionState:
     """Holds runtime state, active callable reference, concurrency locks, and telemetry."""
 
-    def __init__(self, func: Callable, schema: Optional[Type] = None) -> None:
+    def __init__(
+        self,
+        func: Callable,
+        source_code: Optional[str] = None,
+        schema: Optional[Type] = None,
+    ) -> None:
         self.original_func = func
         self.active_func = func
         self.schema = schema
-        self.source_code = extract_function_source(func)
+        self.source_code = source_code if source_code is not None else (extract_function_source(func) or "")
         self.func_name = func.__name__
         self.fingerprint = compute_fingerprint(self.func_name, self.source_code)
         self.is_healed = False
         self.heal_count = 0
         self.last_patch_code: Optional[str] = None
-        self.last_proposed_report: Optional[HealReport] = None
-        self.last_proposed_time: float = 0.0
+        self.proposals: OrderedDict[str, Tuple[HealReport, float]] = OrderedDict()
+        self._max_proposals: int = 50
+        self._lru_lock = threading.Lock()
         self.sync_lock = threading.Lock()
         self._async_lock: Optional[asyncio.Lock] = None
+
+    def get_active_proposal(self, error_key: str, cooldown: float) -> Optional[HealReport]:
+        # Fast-path read-only check with explicit TTL check to avoid blocking async event loop
+        item = self.proposals.get(error_key)
+        if item is not None:
+            report, ts = item
+            if time.time() - ts < cooldown:
+                return report
+        return None
+
+    def record_proposal(self, error_key: str, report: HealReport) -> None:
+        with self._lru_lock:
+            if len(self.proposals) >= self._max_proposals:
+                self.proposals.popitem(last=False)
+            self.proposals[error_key] = (report, time.time())
 
     @property
     def async_lock(self) -> asyncio.Lock:
@@ -158,8 +225,9 @@ def heal(
     schema: Optional[Type] = None,
     validate: Optional[Callable[[Any], bool]] = None,
     mode: str = "auto",
+    heal_on: Tuple[Type[Exception], ...] = DEFAULT_HEAL_EXCEPTIONS,
     propose_cooldown: float = 300.0,
-    idempotent: bool = True,
+    idempotent: bool = False,
     dry_run: bool = True,
     dry_run_timeout: float = 5.0,
     signature_only: bool = False,
@@ -177,18 +245,30 @@ def heal(
     """Decorator that empowers Python functions with autonomous self-healing capabilities."""
 
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
-        state = FunctionState(func, schema)
+        source_code = extract_function_source(func)
+        if source_code is None:
+            logger.warning(
+                "[Kintsugi] Cannot inspect source for '%s' (lambda, REPL, or stripped bytecode). "
+                "Autonomous healing disabled; executing raw callable.",
+                getattr(func, "__name__", "<callable>"),
+            )
+            return func
+
+        state = FunctionState(func, source_code=source_code, schema=schema)
         cache = PatchCache(cache_dir)
         is_coroutine = inspect.iscoroutinefunction(func)
 
         # 1. Cold-start check: Rehydrate from disk cache if a patch already exists and mode == 'auto'
         if mode == "auto":
-            cached_patch = cache.load_patch(state.func_name, state.fingerprint)
+            cached_patch = cache.load_patch(state.func_name, state.fingerprint, original_source=state.source_code)
             if cached_patch:
                 try:
                     fn_globals = getattr(func, "__globals__", {})
                     rehydrated_fn = compile_and_extract_function(
-                        cached_patch, state.func_name, fn_globals
+                        cached_patch,
+                        state.func_name,
+                        fn_globals,
+                        target_module=getattr(func, "__module__", None),
                     )
                     state.active_func = rehydrated_fn
                     state.is_healed = True
@@ -218,6 +298,26 @@ def heal(
                 except Exception as exc:
                     initial_exc = exc
 
+                # Fast filter: only attempt healing on permitted exception types
+                if not isinstance(initial_exc, heal_on):
+                    raise initial_exc
+
+                err_key = extract_error_key(func, initial_exc, state.fingerprint)
+
+                # Lock-free fast path check for active proposal in mode='propose'
+                if mode == "propose":
+                    cached_prop = state.get_active_proposal(err_key, propose_cooldown)
+                    if cached_prop is not None:
+                        logger.debug(
+                            "[Kintsugi] Returning cached proposal for '%s' (%s) [lock-free].",
+                            state.func_name,
+                            err_key,
+                        )
+                        raise ProposedPatchError(
+                            f"Patch proposed for '{state.func_name}' ({err_key}) but not applied (mode='propose').",
+                            report=cached_prop,
+                        )
+
                 # Double-Checked Locking: Acquire async lock to prevent Thundering Herd
                 async with state.async_lock:
                     if state.is_healed and mode == "auto":
@@ -226,25 +326,29 @@ def heal(
                             return validate_contract(result, schema, predicate=validate)
                         except Exception as retry_exc:
                             initial_exc = retry_exc
+                            if not isinstance(initial_exc, heal_on):
+                                raise initial_exc
+                            err_key = extract_error_key(func, initial_exc, state.fingerprint)
 
-                    # Cooldown deduplication in propose mode to prevent burning LLM calls
-                    if mode == "propose" and state.last_proposed_report is not None:
-                        elapsed = time.time() - state.last_proposed_time
-                        if elapsed < propose_cooldown:
+                    # Cooldown deduplication in propose mode under lock
+                    if mode == "propose":
+                        cached_prop = state.get_active_proposal(err_key, propose_cooldown)
+                        if cached_prop is not None:
                             logger.debug(
-                                "[Kintsugi] Returning cached proposal for '%s' (cooldown active: %.1fs remaining).",
+                                "[Kintsugi] Returning cached proposal for '%s' (%s) [under lock].",
                                 state.func_name,
-                                propose_cooldown - elapsed,
+                                err_key,
                             )
                             raise ProposedPatchError(
-                                f"Patch proposed for '{state.func_name}' but not applied (mode='propose').",
-                                report=state.last_proposed_report,
+                                f"Patch proposed for '{state.func_name}' ({err_key}) but not applied (mode='propose').",
+                                report=cached_prop,
                             )
 
                     logger.warning(
-                        "[Kintsugi] Error in '%s': %s. Initiating repair cycle (mode='%s')...",
+                        "[Kintsugi] Error in '%s': %s (%s). Initiating repair cycle (mode='%s')...",
                         state.func_name,
                         initial_exc,
+                        err_key,
                         mode,
                     )
                     active_provider = get_provider()
@@ -265,7 +369,7 @@ def heal(
                                 type(current_exc), current_exc, current_exc.__traceback__
                             )
                         )
-                        system_prompt, user_prompt = build_repair_prompt(
+                        system_prompt, user_prompt, secret_map = build_repair_prompt(
                             func=func,
                             source_code=state.last_patch_code or state.source_code,
                             exc=current_exc,
@@ -279,16 +383,22 @@ def heal(
 
                         try:
                             # 1. Ask LLM for patch
-                            patch_code = await active_provider.agenerate_patch(
+                            raw_patch_code = await active_provider.agenerate_patch(
                                 user_prompt, system_prompt
+                            )
+                            patch_code = restore_mapped_secrets(
+                                raw_patch_code, secret_map, original_source=state.source_code
                             )
 
                             # 2. Compile in sandbox
                             candidate_fn = compile_and_extract_function(
-                                patch_code, state.func_name, fn_globals
+                                patch_code,
+                                state.func_name,
+                                fn_globals,
+                                target_module=getattr(func, "__module__", None),
                             )
 
-                            # 3. Dry-run test with failing inputs if idempotent
+                            # 3. Dry-run test with failing inputs only if idempotent
                             if dry_run and idempotent:
                                 raw_result = await asyncio.wait_for(
                                     candidate_fn(*args, **kwargs),
@@ -305,25 +415,25 @@ def heal(
                                 initial_exc=initial_exc,
                                 tb_str=tb_str,
                                 original_code=state.source_code,
-                                healed_code=patch_code,
+                                healed_code=raw_patch_code,
                                 attempts=attempt,
                                 provider=active_provider.__class__.__name__,
                                 model=active_provider.model,
                             )
 
                             if on_heal:
-                                await _adispatch_on_heal(on_heal, report, patch_code)
+                                await _adispatch_on_heal(on_heal, report, raw_patch_code)
 
                             # If mode == 'propose', record proposal for cooldown deduplication and do not hot-swap
                             if mode == "propose":
-                                state.last_proposed_report = report
-                                state.last_proposed_time = time.time()
+                                state.record_proposal(err_key, report)
                                 logger.info(
-                                    "[Kintsugi] Validated patch proposal for '%s'. Halting execution as mode='propose'.",
+                                    "[Kintsugi] Validated patch proposal for '%s' (%s). Halting execution as mode='propose'.",
                                     state.func_name,
+                                    err_key,
                                 )
                                 raise ProposedPatchError(
-                                    f"Patch proposed for '{state.func_name}' but not applied (mode='propose').",
+                                    f"Patch proposed for '{state.func_name}' ({err_key}) but not applied (mode='propose').",
                                     report=report,
                                 )
 
@@ -337,12 +447,13 @@ def heal(
                             cache.save_patch(
                                 state.func_name,
                                 state.fingerprint,
-                                patch_code,
+                                raw_patch_code,
                                 metadata={
                                     "original_error": str(initial_exc),
                                     "attempts": attempt,
                                     "provider": active_provider.__class__.__name__,
                                     "model": active_provider.model,
+                                    "placeholder_count": len(secret_map),
                                 },
                             )
 
@@ -354,7 +465,8 @@ def heal(
 
                             if validated_result is not None:
                                 return validated_result
-                            return await candidate_fn(*args, **kwargs)
+                            raw_res = await asyncio.wait_for(candidate_fn(*args, **kwargs), timeout=dry_run_timeout)
+                            return validate_contract(raw_res, schema, predicate=validate)
 
                         except ProposedPatchError:
                             raise
@@ -389,6 +501,26 @@ def heal(
                 except Exception as exc:
                     initial_exc = exc
 
+                # Fast filter: only attempt healing on permitted exception types
+                if not isinstance(initial_exc, heal_on):
+                    raise initial_exc
+
+                err_key = extract_error_key(func, initial_exc, state.fingerprint)
+
+                # Lock-free fast path check for active proposal in mode='propose'
+                if mode == "propose":
+                    cached_prop = state.get_active_proposal(err_key, propose_cooldown)
+                    if cached_prop is not None:
+                        logger.debug(
+                            "[Kintsugi] Returning cached proposal for '%s' (%s) [lock-free].",
+                            state.func_name,
+                            err_key,
+                        )
+                        raise ProposedPatchError(
+                            f"Patch proposed for '{state.func_name}' ({err_key}) but not applied (mode='propose').",
+                            report=cached_prop,
+                        )
+
                 # Double-Checked Locking: Acquire threading lock to prevent race conditions
                 with state.sync_lock:
                     if state.is_healed and mode == "auto":
@@ -397,25 +529,29 @@ def heal(
                             return validate_contract(result, schema, predicate=validate)
                         except Exception as retry_exc:
                             initial_exc = retry_exc
+                            if not isinstance(initial_exc, heal_on):
+                                raise initial_exc
+                            err_key = extract_error_key(func, initial_exc, state.fingerprint)
 
-                    # Cooldown deduplication in propose mode to prevent burning LLM calls
-                    if mode == "propose" and state.last_proposed_report is not None:
-                        elapsed = time.time() - state.last_proposed_time
-                        if elapsed < propose_cooldown:
+                    # Cooldown deduplication in propose mode under lock
+                    if mode == "propose":
+                        cached_prop = state.get_active_proposal(err_key, propose_cooldown)
+                        if cached_prop is not None:
                             logger.debug(
-                                "[Kintsugi] Returning cached proposal for '%s' (cooldown active: %.1fs remaining).",
+                                "[Kintsugi] Returning cached proposal for '%s' (%s) [under lock].",
                                 state.func_name,
-                                propose_cooldown - elapsed,
+                                err_key,
                             )
                             raise ProposedPatchError(
-                                f"Patch proposed for '{state.func_name}' but not applied (mode='propose').",
-                                report=state.last_proposed_report,
+                                f"Patch proposed for '{state.func_name}' ({err_key}) but not applied (mode='propose').",
+                                report=cached_prop,
                             )
 
                     logger.warning(
-                        "[Kintsugi] Error in '%s': %s. Initiating repair cycle (mode='%s')...",
+                        "[Kintsugi] Error in '%s': %s (%s). Initiating repair cycle (mode='%s')...",
                         state.func_name,
                         initial_exc,
+                        err_key,
                         mode,
                     )
                     active_provider = get_provider()
@@ -436,7 +572,7 @@ def heal(
                                 type(current_exc), current_exc, current_exc.__traceback__
                             )
                         )
-                        system_prompt, user_prompt = build_repair_prompt(
+                        system_prompt, user_prompt, secret_map = build_repair_prompt(
                             func=func,
                             source_code=state.last_patch_code or state.source_code,
                             exc=current_exc,
@@ -450,16 +586,22 @@ def heal(
 
                         try:
                             # 1. Ask LLM for patch
-                            patch_code = active_provider.generate_patch(
+                            raw_patch_code = active_provider.generate_patch(
                                 user_prompt, system_prompt
+                            )
+                            patch_code = restore_mapped_secrets(
+                                raw_patch_code, secret_map, original_source=state.source_code
                             )
 
                             # 2. Compile in sandbox
                             candidate_fn = compile_and_extract_function(
-                                patch_code, state.func_name, fn_globals
+                                patch_code,
+                                state.func_name,
+                                fn_globals,
+                                target_module=getattr(func, "__module__", None),
                             )
 
-                            # 3. Dry-run test with failing inputs if idempotent
+                            # 3. Dry-run test with failing inputs only if idempotent
                             if dry_run and idempotent:
                                 raw_result = execute_with_timeout(
                                     candidate_fn, args, kwargs, timeout_sec=dry_run_timeout
@@ -475,25 +617,25 @@ def heal(
                                 initial_exc=initial_exc,
                                 tb_str=tb_str,
                                 original_code=state.source_code,
-                                healed_code=patch_code,
+                                healed_code=raw_patch_code,
                                 attempts=attempt,
                                 provider=active_provider.__class__.__name__,
                                 model=active_provider.model,
                             )
 
                             if on_heal:
-                                _dispatch_on_heal(on_heal, report, patch_code)
+                                _dispatch_on_heal(on_heal, report, raw_patch_code)
 
                             # If mode == 'propose', record proposal for cooldown deduplication and do not hot-swap
                             if mode == "propose":
-                                state.last_proposed_report = report
-                                state.last_proposed_time = time.time()
+                                state.record_proposal(err_key, report)
                                 logger.info(
-                                    "[Kintsugi] Validated patch proposal for '%s'. Halting execution as mode='propose'.",
+                                    "[Kintsugi] Validated patch proposal for '%s' (%s). Halting execution as mode='propose'.",
                                     state.func_name,
+                                    err_key,
                                 )
                                 raise ProposedPatchError(
-                                    f"Patch proposed for '{state.func_name}' but not applied (mode='propose').",
+                                    f"Patch proposed for '{state.func_name}' ({err_key}) but not applied (mode='propose').",
                                     report=report,
                                 )
 
@@ -507,12 +649,13 @@ def heal(
                             cache.save_patch(
                                 state.func_name,
                                 state.fingerprint,
-                                patch_code,
+                                raw_patch_code,
                                 metadata={
                                     "original_error": str(initial_exc),
                                     "attempts": attempt,
                                     "provider": active_provider.__class__.__name__,
                                     "model": active_provider.model,
+                                    "placeholder_count": len(secret_map),
                                 },
                             )
 
@@ -524,7 +667,8 @@ def heal(
 
                             if validated_result is not None:
                                 return validated_result
-                            return candidate_fn(*args, **kwargs)
+                            raw_res = execute_with_timeout(candidate_fn, args, kwargs, timeout_sec=dry_run_timeout)
+                            return validate_contract(raw_res, schema, predicate=validate)
 
                         except ProposedPatchError:
                             raise

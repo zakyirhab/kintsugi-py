@@ -6,7 +6,6 @@
 [![PyPI version](https://img.shields.io/pypi/v/kintsugi-py.svg?color=blue)](https://pypi.org/project/kintsugi-py/)
 [![Python versions](https://img.shields.io/pypi/pyversions/kintsugi-py.svg)](https://pypi.org/project/kintsugi-py/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/zakyirhab/kintsugi-py/blob/main/LICENSE)
-[![Tests](https://img.shields.io/badge/tests-48%20passed-brightgreen.svg)]()
 
 <p align="center">
   <img src="assets/demo.gif" alt="KintsugiPy Autonomous Runtime Repair Demo" width="850">
@@ -15,13 +14,13 @@
 **KintsugiPy** is an autonomous, self-healing runtime engine for Python functions designed for **Web Scraping, ETL pipelines, and API integrations**. When a function encounters an unhandled exception, upstream layout shift, or malformed dirty payload, KintsugiPy:
 
 1. **Captures Crime Scene Telemetry**: Extracts function AST source, local variables, traceback, and execution context.
-2. **Scrubs Sensitive Data & PII**: Automatically redacts API keys, tokens, emails, and passwords before constructing the repair prompt.
-3. **Generates Surgical Patches**: Calls your LLM of choice (Local, Groq, OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter).
-4. **Defense-in-Depth AST Guardrail**: Verifies candidate patches against security policies—blocking dangerous imports (`os`, `sys`, `subprocess`, `shutil`), builtins (`eval`, `exec`, `open`, `getattr`), and dunder escape chains (`__subclasses__`).
-5. **Validates Contracts with Timeout**: Dry-runs the patch in an isolated execution harness with strict timeouts to prevent stalls, and verifies return contracts using **Pydantic v2** or custom predicates.
+2. **Scrubs Sensitive Data & PII**: Automatically redacts API keys, tokens, emails, and passwords before constructing the repair prompt. Hardcoded secrets in source code are reversibly masked.
+3. **Exception Filtering (`heal_on`)**: Focuses on data and logical contract breakage (KeyError, TypeError, ValueError, schema shifts). Network/system failures (`TimeoutError`, `ConnectionError`) immediately bubble up without wasting LLM tokens.
+4. **Strict AST Allowlist Guardrail**: Verifies candidate patches against an import allowlist (`re`, `json`, `math`, `datetime`, `decimal`, `urllib.parse`, etc.) and blanket-bans all dunder (`__*`) and reflection attributes (`f_*`, `tb_*`, `gi_*`).
+5. **Validates Contracts with Timeout**: Compiles patches in isolated namespaces, optionally dry-runs with strict timeouts, and verifies return contracts using **Pydantic v2** or custom predicates.
 6. **In-Memory Hot-Swapping (`mode="auto"`)**: Swaps the active callable pointer in place. Future calls run the repaired code natively with **zero LLM latency**.
-7. **Human-in-the-Loop (`mode="propose"`)**: For high-compliance systems, generates patch diffs and emits `HealReport` proposals without modifying runtime execution.
-8. **Tamper-Resistant Cache**: Persists validated patches with HMAC integrity checks and AST re-verification to `.kintsugi_cache/` for zero-token cold starts.
+7. **Human-in-the-Loop (`mode="propose"`)**: For high-compliance systems, generates patch diffs and emits `HealReport` proposals with granular frame-level deduplication.
+8. **Tamper-Evident Cache**: Persists validated patches with context-bound HMAC integrity checks (`func_name:fingerprint:code`) to `.kintsugi_cache/` for zero-token cold starts.
 
 ---
 
@@ -211,18 +210,51 @@ results = await asyncio.gather(*(fetch_stock_quote("AAPL") for _ in range(50)))
 
 ---
 
-## 🛡️ AST Safety & Defense-in-Depth
+## 🛡️ Security Architecture & Trust Boundary
 
-> **Note on Security**: Kintsugi's guardrail is a static safety heuristic designed to prevent accidental damage and common sandbox escape vectors. It reduces risk substantially but **is not an OS-level sandbox**. For untrusted or multi-tenant code execution, always run inside isolated containers.
+KintsugiPy employs defense-in-depth AST parsing, an isolated runtime namespace, and memory-only secret mapping to safeguard self-healing operations:
+
+### Trust Boundary
+1. **Local Package Namespace (`myapp.*`)**: Functions, utilities, and helper classes defined within the same package prefix (`pkg = target_module.rsplit('.', 1)[0]`) are permitted in the healed function namespace (`mod == pkg or mod.startswith(pkg + '.')`). Unrelated packages (e.g. `myapp_evil.*`) are rejected.
+2. **Data Model Allowlist**: `pydantic.BaseModel` and `@dataclass` classes and instances are strictly allowlisted to ensure schemas and structured models remain accessible.
+3. **Strict Whitelist for Everything Else**: External modules, OS-level utilities (`os.system`, `subprocess`), reflection primitives, and system state are strictly blocked from the execution namespace.
+
+### Isolation Limits & Sandbox Boundaries
+- **Thread Timeout Heuristic**: Dry-run verification executes inside daemon threads with strict timeouts. While effective against infinite loops and stalled pure-Python routines, C-extensions or uninterruptible native calls cannot be forcibly terminated by Python threads.
+- **Defense-in-Depth, Not an OS Sandbox**: Kintsugi's sandbox is a hardened static and runtime barrier designed to reject insecure LLM hallucinations. For untrusted, adversarial, or multi-tenant workloads, **container-level isolation** (Docker, gVisor, Firecracker) is strongly recommended.
+
+---
+
+## 🔄 Migration Guide: Upgrading from v0.3.1
+
+### 1. Default `idempotent=False`
+In v0.3.1, dry-run testing executed automatically. Starting in v0.4.0, functions are non-idempotent by default to prevent unwanted side effects (e.g. charging credit cards, appending duplicate DB records).
+```python
+# If your function is a pure, side-effect-free transform:
+@heal(idempotent=True)
+def parse_catalog(data: str) -> dict:
+    ...
+```
+
+### 2. Strict AST & Filtered `__builtins__`
+Generated patches execute inside `SAFE_BUILTINS` without access to standard builtins like `breakpoint()`, `exit()`, `quit()`, or `help()`. Dynamic class creation (`type("Foo", (), {})`, `type(*args)`) and `global`/`nonlocal` statements are blocked by AST inspection.
+
+### 3. Fail-Closed Cache Rehydration
+If you migrate hardcoded credentials to environment variables, cached patches containing historical placeholders will safely invalidate on cold start, falling back to original code.
+
+---
+
+## 🛡️ AST Safety & Defense-in-Depth
 
 | Rule | Enforcement | Result |
 | :--- | :--- | :--- |
-| **Forbidden Modules** | `import os`, `sys`, `subprocess`, `shutil`, `pty`, `ctypes`, `importlib` | ❌ `SecurityViolationError` |
-| **Forbidden Imports** | `from os import path`, `from subprocess import run` | ❌ `SecurityViolationError` |
-| **Dangerous Builtins** | `eval()`, `exec()`, `open()`, `__import__()`, `input()`, `getattr()`, `globals()`, `locals()` | ❌ `SecurityViolationError` |
-| **Dunder Escape Chains** | Access to `__subclasses__`, `__bases__`, `__globals__`, `__builtins__`, `__code__` | ❌ `SecurityViolationError` |
+| **Strict Import Allowlist** | Only approved data modules (`re`, `json`, `math`, `datetime`, `decimal`, `urllib.parse`, `typing`, `collections`, `itertools`, etc.) | ❌ `SecurityViolationError` for unapproved modules |
+| **Forbidden I/O & Process** | `os`, `sys`, `subprocess`, `shutil`, `pathlib`, `io`, `socket`, `inspect`, `gc`, `multiprocessing`, `urllib.request` | ❌ `SecurityViolationError` |
+| **Dangerous Builtins** | `eval()`, `exec()`, `open()`, `__import__()`, `input()`, `getattr()`, `setattr()`, `globals()`, `locals()`, `vars()`, `breakpoint()` | ❌ `SecurityViolationError` |
+| **Blanket Dunder Ban** | Any attribute starting with `__` (e.g. `__subclasses__`, `__class__`, `__globals__`, `__dict__`) | ❌ `SecurityViolationError` |
+| **Blanket Reflection Ban** | Frame/traceback internals starting with `f_`, `tb_`, `gi_`, `cr_`, `ag_` | ❌ `SecurityViolationError` |
 | **Loop/Timeout Protection** | Patches are tested with strict daemon thread timeouts | ❌ `TimeoutError` on stalls |
-| **Safe Pure Logic** | `re`, `json`, `math`, `datetime`, `urllib.parse`, string slicing | ✅ Validated & Approved |
+| **Safe Pure Logic** | String manipulation, parsing, mathematical calculations, type transformations | ✅ Validated & Approved |
 
 ---
 
@@ -235,16 +267,28 @@ results = await asyncio.gather(*(fetch_stock_quote("AAPL") for _ in range(50)))
 | `schema` | `Type[BaseModel]` / `Type` | `None` | Optional Pydantic model or expected return type. |
 | `validate` | `Callable[[Any], bool]` | `None` | Custom validation predicate (catches silent empty results like `[]` or `{}`). |
 | `mode` | `Literal["auto", "propose"]` | `"auto"` | `"auto"` hot-swaps in memory; `"propose"` generates patch proposals for human review. |
-| `idempotent` | `bool` | `True` | Set `False` if failing inputs have external side effects (skips dry-run replay). |
+| `heal_on` | `Tuple[Type[Exception], ...]` | `DEFAULT_HEAL_EXCEPTIONS` | Exception types that trigger repair (`KeyError`, `TypeError`, `ValueError`, `IndexError`, `AttributeError`, etc.). Network errors bypass healing. |
+| `propose_cooldown`| `float` | `300.0` | Cooldown period (seconds) per error type and crash frame to prevent burning redundant LLM calls on batched failures. |
+| `idempotent` | `bool` | `False` | Set `True` if failing inputs are safe to replay during dry-run testing. Default `False` prevents unintended side effects on runtime arguments. |
 | `signature_only` | `bool` | `False` | Send only parameter shapes/types to LLM without leaking real data values. |
 | `include_args` | `bool` | `True` | Set `False` to omit runtime crash arguments entirely from the prompt. |
 | `dry_run_timeout` | `float` | `5.0` | Maximum seconds allowed for dry-run testing before rejecting patch. |
 | `max_retries` | `int` | `3` | Maximum LLM repair iterations on recurring errors. |
 | `provider` | `str` | `None` | Explicit provider name (`openai`, `groq`, `anthropic`, `gemini`, `deepseek`, `openrouter`, `local`). |
 | `model` | `str` | `None` | Model identifier (e.g. `llama-3.3-70b-versatile`, `claude-3-5-sonnet-20241022`). |
-| `cache_dir` | `str` / `None` | `".kintsugi_cache"` | Directory for HMAC-signed patches. Set `None` to disable disk caching. |
+| `cache_dir` | `str` / `None` | `".kintsugi_cache"` | Directory for tamper-evident HMAC-signed patches. Set `None` to disable disk caching. |
 | `chain` | `List[dict \| LLMProvider]` | `None` | Ordered list of fallback providers. |
 | `on_heal` | `Callable[[HealReport], Any]` | `None` | Event callback triggered when a function is healed or proposed. |
+
+### Environment Variables
+
+| Variable | Description |
+| :--- | :--- |
+| `KINTSUGI_CACHE_SECRET` | 32+ character HMAC key for tamper-evident patch verification. Strongly recommended for multi-worker runtimes (Uvicorn/Gunicorn) or read-only container environments (Docker, Lambda). |
+| `GROQ_API_KEY` | API key for Groq Cloud. |
+| `OPENAI_API_KEY` | API key for OpenAI. |
+| `ANTHROPIC_API_KEY` | API key for Anthropic Claude. |
+| `GEMINI_API_KEY` | API key for Google Gemini. |
 
 ---
 
